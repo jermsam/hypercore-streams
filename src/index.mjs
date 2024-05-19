@@ -8,7 +8,6 @@ import { core, getPublicKey, store } from "./store";
   let writableStream;
   // write
   await (async () => {
-    const publicKey = await getPublicKey();
     writableStream = core.createWriteStream({ live: true });
     for (const data of expected) {
       const encoded = b4a.from(data);
