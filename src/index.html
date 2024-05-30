@@ -1,5 +1,5 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
   <head>
     <title>JavaScript Sandbox</title>
     <meta charset="UTF-8" />
@@ -7,17 +7,27 @@
 
   <body>
     <div id="app"></div>
-    <div style='display: flex; gap: 10px; flex-direction: row;'>
+ <div style="display: flex; justify-content: space-between;">
+   <div style="display: flex">
+     <button id="start">START</button>
+     <button id="stop">STOP</button>
+   </div>
+   <div style="display: flex">
+     <button id="startRemote">START</button>
+     <button id="stopRemote">STOP</button>
+   </div>
+ </div>
+    <div style='display: flex; justify-content: space-between;'>
       <div style='display: flex; flex-direction: column; width: 400px; height: 200px; border: 1px solid;'>
-        <p>INPUT</p>
+        <p>FROM CAMERA</p>
         <div>
-          <video id="inputvideo" style="width: 100%; height: 100%" autoplay/>
+          <video id="localVideo" style="width: 100%; height: 100%" autoplay></video>
         </div>
       </div>
       <div style='display: flex; flex-direction: column; width: 400px; height: 200px; border: 1px solid;'>
-        <p>OUTPUT</p>
+        <p>FROM HYPERCORE</p>
         <div>
-          <video id="outputvideo" style="width: 100%; height: 100%" autoplay/>
+          <video id="remoteVideo" style="width: 100%; height: 100%" autoplay></video>
         </div>
       </div>
     </div>

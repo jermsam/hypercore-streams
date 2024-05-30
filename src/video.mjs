@@ -1,140 +1,208 @@
 import "./styles.css";
-import b4a from "b4a";
-import InstrumentedTransformStream from "./video-utils/InstrumentedTransformStream.mjs";
+import b4a from 'b4a'
+import { serialize, deserialize } from 'bson'
 
-import { videocore, getPublicKey, store } from "./store";
-import { getVideoStream } from "./video-utils/generators.mjs";
+import { getPublicKey, store, core} from './store';
 
-const inputput = document.getElementById("inputvideo");
+const localVideo = document.getElementById("localVideo");
+const startButton = document.getElementById("start");
+const stopButton = document.getElementById("stop");
 
-(async () => {
-  const senderWorker = new Worker(new URL("worker.mjs", import.meta.url), {
-    type: "module",
-  });
 
-  const config = {
-    codec: "vp8",
-    width: 640,
-    height: 480,
-    bitrate: 2_000_000, // 2 Mbps
-    framerate: 30,
-  };
+const remoteVideo = document.getElementById("remoteVideo");
+const startRemote = document.getElementById("startRemote");
+const stopRemote = document.getElementById("stopRemote");
 
-  // write
-  await (async () => {
-    const stream = await getVideoStream();
-    const videoTrack = stream.getVideoTracks()[0];
-    const videoTrackProcessor = new MediaStreamTrackProcessor({
-      track: videoTrack,
-    });
+document.addEventListener('DOMContentLoaded', () => {
+  let track;
+  // const bson = new BSON();
+  let remoteTrack;
 
-    let localFramesToClose = {};
-    const readableStreamFromTrackProcessor = videoTrackProcessor.readable;
+  function encodeChunk(chunk) {
+    const { type, timestamp, duration, byteLength } = chunk;
+    const data = new Uint8Array(byteLength); // Create a new Uint8Array
+    chunk.copyTo(data); // Copy data from the chunk to the array
+    const bsonData = {
+      type,
+      timestamp,
+      duration,
+      byteLength,
+      data: b4a.from(data.buffer)  // Convert ArrayBuffer to Buffer
+    };
 
-    const localFramesToCloseTramsformer = new InstrumentedTransformStream({
-      transform(videoFrame, controller) {
-        const timestamp = videoFrame.timestamp;
-        localFramesToClose[timestamp] = videoFrame;
-        controller.enqueue(videoFrame);
-      },
-    });
+    return b4a.from(serialize(bsonData)); // Serialize to BSON and then to Buffer
+  }
+  //
+  function decodeChunk(encoded) {
+    const bsonData = deserialize(b4a.toBuffer(encoded)); // Deserialize BSON to object
+    const { type, timestamp, duration, byteLength, data } = bsonData;
+    const arrayBuffer = data.buffer; // Convert Buffer back to ArrayBuffer
+    const decodedBsonData = {
+      type,
+      timestamp,
+      duration,
+      byteLength,
+      data: arrayBuffer  // Convert ArrayBuffer to Buffer
+    };
+    return new EncodedVideoChunk(decodedBsonData);
+  }
 
-    // set the local frame
-    readableStreamFromTrackProcessor.pipeThrough(localFramesToCloseTramsformer);
+  // click start button
+  startButton.addEventListener("click", async () => {
+    // read from webcam
+    const stream = await navigator.mediaDevices.getUserMedia({video: true})
+    const [firstTrack] = stream.getVideoTracks();
+    track = firstTrack;
 
-    // We need to encode it so we can append it to a hypercore that we can replicate over a hyperswarm and thus decode it.
-    // ... but better to do this in another thread.
+    const mediaProcessor = new MediaStreamTrackProcessor({track});
 
-    const localFrameWritableStream = localFramesToCloseTramsformer.writable;
-    const localFrameReadableStream = localFramesToCloseTramsformer.readable;
+    const inputStream = mediaProcessor.readable;
 
-    senderWorker.postMessage({
-      type: "sender",
-      config,
-    });
-    // senderWorker.postMessage(
-    //   {
-    //     type: "process",
-    //     config,
-    //     streams: {
-    //       localFrameWritableStream,
-    //       localFrameReadableStream,
-    //     },
-    //   },
-    //   [localFrameWritableStream, localFrameReadableStream, config],
-    // );
 
-    // close frame transformer
-    const closeLocalFrameTramsformer = new InstrumentedTransformStream({
-      transform(videoFrame, controller) {
-        const timestamp = videoFrame.timestamp;
-        const inputFrame = localFramesToClose[timestamp];
-        if (inputFrame) {
-          if (inputFrame !== videoFrame) {
-            inputFrame.close();
+    const mediaGenerator = new MediaStreamTrackGenerator({kind: 'video'})
+    const outputStream = mediaGenerator.writable;
+
+
+    // Create the TransformStream for encoding
+    const encoderTransformStream = new TransformStream({
+      start(controller) {
+        this.frame_counter = 0;
+        this.encoder = new VideoEncoder({
+          output: (chunk) => {
+            // const { type, timestamp, data } = chunk;
+            // console.log(timestamp);
+            const encoded = encodeChunk(chunk)
+              core.append(encoded)
+            controller.enqueue(encoded);
+          },
+          error: (error) => {
+            console.error('VideoEncoder error:', error);
           }
-          delete inputFrame;
-        }
-        controller.enqueue(videoFrame);
+        });
+
+        this.encoder.configure({
+          codec: 'vp8',
+          width: track.getSettings().width,
+          height: track.getSettings().height,
+          bitrate: 1_000_000,
+          framerate: 30,
+        });
       },
+      async transform(frame, controller) {
+        if (this.encoder.encodeQueueSize > 2) {
+          frame.close();
+        } else {
+          this.frame_counter++;
+          const insert_keyframe = this.frame_counter % 150 === 0;
+          this.encoder.encode(frame, { keyFrame: insert_keyframe });
+          frame.close();
+        }
+      },
+      flush() {
+        this.encoder.flush();
+      }
     });
 
-    const trackGenerator = new MediaStreamTrackGenerator({ kind: "video" });
+    // Create the TransformStream for decoding
+    const decoderTransformStream = new TransformStream({
+      start(controller) {
+        this.decoder = new VideoDecoder({
+          output: (frame) => {
 
-    // close local frame
-    localFrameReadableStream
-      .pipeThrough(closeLocalFrameTramsformer)
-      .pipeTo(trackGenerator.writable);
+            controller.enqueue(frame);
+          },
+          error: (error) => console.error('VideoDecoder error:', error)
+        });
 
-    inputput.srcObject = new MediaStream([trackGenerator]);
+        this.decoder.configure({ codec: 'vp8' });
+      },
+      async transform(chunk, controller) {
+        const decoded = decodeChunk(chunk);
+        this.decoder.decode(decoded);
+      }
+    });
 
-    // const { supported } = await VideoEncoder.isConfigSupported(config);
-    // writableStream = videocore.createWriteStream({ live: true });
+    inputStream
+      .pipeThrough(encoderTransformStream)
+      .pipeThrough(decoderTransformStream)
+      .pipeTo(outputStream);
 
-    // let encoder;
-    // if (supported) {
-    //   encoder = new VideoEncoder({
-    //     output: (chunk, metadata) => {
-    //       // console.log({ chunk: chunk.byteLength });
-    //       // actual bytes of encoded data
-    //       const chunkData = new Uint8Array(chunk.byteLength);
-    //       chunk.copyTo(chunkData);
+    localVideo.srcObject = new MediaStream([mediaGenerator])
 
-    //       // Write to writableStream
-    //       writableStream.write(chunkData);
-    //     },
-    //     error: (e) => {
-    //       console.log(e.message);
-    //     },
-    //   });
-    //   encoder.configure(config);
-    // } else {
-    //   // Try another config.
-    // }
-    // if (stream) {
-    //   // document.getElementById("inputvideo").srcObject = stream;
-    //   await processVideoStream(stream, encoder);
-    // }
-  })();
+  })
 
-  // await (async () => {
-  //   await new Promise((resolve) => writableStream.on("finish", resolve));
-  // })();
 
-  //read
-  await (async () => {
-    const publicKey = await getPublicKey(videocore);
-    console.log("sss");
-    const readerCore = store.get(publicKey);
-    await readerCore.ready();
-    const readableStream = readerCore.createReadStream();
-    let bucket = [];
-    // for await (const data of readableStream) {
-    //   console.log({ data });
-    //   // const decoded = b4a.toString(data);
-    //   // console.log({ decoded: decoded.toString() });
-    //   // bucket.push(decoded);
-    // }
-    const output = document.getElementById("outputvideo");
-  })();
-})();
+  // click stop button
+  stopButton.addEventListener("click", () => {
+    if(track) {
+      track.stop();
+    }
+  })
+
+  startRemote.addEventListener("click", async () => {
+    const streamTransformer = new TransformStream({
+      async start(controller) {
+        const publicKey = await getPublicKey();
+        const readerCore = store.get(publicKey);
+        await readerCore.ready();
+
+        const xReadable = readerCore.createReadStream({ live: true });
+
+        // Use TransformStream's internal functionality directly
+        xReadable.on('data', (chunk) => {
+          console.log({ chunk });
+          controller.enqueue(chunk);
+        });
+
+        xReadable.once('error', (error) => {
+          console.error('Stream error:', error);
+          controller.error(error); // Propagate error to TransformStream
+        });
+
+        xReadable.once('end', () => {
+          controller.close();
+        });
+      },
+      transform(chunk, controller) {
+        // No transformation needed, directly enqueue
+        controller.enqueue(chunk);
+      }
+    });;
+
+    const decoderTransformStream = new TransformStream({
+      start(controller) {
+        this.decoder = new VideoDecoder({
+          output: (frame) => {
+
+            controller.enqueue(frame);
+          },
+          error: (error) => console.error('VideoDecoder error:', error)
+        });
+
+        this.decoder.configure({ codec: 'vp8' });
+      },
+      async transform(chunk, controller) {
+        const decoded = decodeChunk(chunk);
+        this.decoder.decode(decoded);
+      }
+    });
+
+    const remoteInput = streamTransformer.readable.pipeThrough(decoderTransformStream)
+
+    const mediaGenerator = new MediaStreamTrackGenerator({kind: 'video'})
+    remoteTrack = mediaGenerator
+    const outputStream = mediaGenerator.writable;
+    remoteInput.pipeTo(outputStream)
+    remoteVideo.srcObject = new MediaStream([mediaGenerator])
+  })
+
+  stopRemote.addEventListener("click", async () => {
+    if(remoteTrack) {
+      remoteTrack.stop()
+    }
+  })
+})
+
+
+
+
